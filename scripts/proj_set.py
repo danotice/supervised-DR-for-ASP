@@ -80,13 +80,13 @@ def proj_sel(metadata, selFeats, outpath, scaler, cores, da_file=''):
         
     iSpace.PCA(n_components=2)
 
-    iSpace.PILOT(n_components=2,mode='num', num_params={'seed':111, 'ntries':5})
+    iSpace.PILOT(n_components=2,mode='a')
     iSpace.PLS(n_components=2)
     iSpace.getRelativePerf(min=True)
     iSpace.PLS(mode='rel', n_components=2)
 
-    ip.saveProjCoords(iSpace.PlotProj, outpath + 'proj_coords.csv',
-                      extra_cols=['Best','group'])
+    # ip.saveProjCoords(iSpace.PlotProj, outpath + 'proj_coords.csv',
+    #                   extra_cols=['Best','group'])
     
     with open(outpath + 'iSpace.pkl', 'wb') as f:
         pkl.dump(iSpace, f)
@@ -115,7 +115,7 @@ def proj_eval(ipath, outpath):
     with open(outpath + 'proj_eval.pkl', 'wb') as f:
         pkl.dump(is_eval, f)
 
-def pred_eval(metadata,selFeats,ipath,outpath, cores, pred_params=None,tie_lab=None):
+def pred_eval(metadata,ipath,outpath, cores, pred_params=None,tie_lab=None):
     with open(outpath + ipath, 'rb') as f:
         iSpace = pkl.load(f)
     
@@ -132,19 +132,22 @@ def pred_eval(metadata,selFeats,ipath,outpath, cores, pred_params=None,tie_lab=N
 
     iSpace.doParallel(cores)
     is_pred = ipe.PredictionEval(iSpace.PlotProj, split=True)
-
-    metadata_train = pd.read_csv(f'{outpath}metadata_train.csv', index_col=0)
-    pred_paramDF = ipe.pred_cv(metadata_train,selFeats,outpath,iSpace)
-
+    
+    # keys with no pred_ cols
+    pred_list = [p for p in is_pred.projections.keys() if 
+                 len([c for c in is_pred.projections[p].columns if c.startswith('pred_')])==0]
     if pred_params is None:
-        pred_params = pd.DataFrame(
-            {'SVM':[{}]*len(is_pred.projections.keys()),'KNN':[{}]*len(is_pred.projections.keys())},
-            index=is_pred.projections.keys()
+        pred_paramDF = pd.DataFrame(
+            {'SVM':[{}]*len(pred_list),'KNN':[{}]*len(pred_list)},
+            index=pred_list
         )
+    else:
+        pred_paramDF = pred_params
 
-    for proj in is_pred.projections.keys():
+    
+    for proj in pred_list:
         is_pred.makePredictions_svm(proj, pred_paramDF.loc[proj,'SVM'])
-        is_pred.makePredictions_knn(proj, pred_paramDF.loc[proj,'KNN'])
+        # is_pred.makePredictions_knn(proj, pred_paramDF.loc[proj,'KNN'])
     
     is_pred.makePredictions_avg(avg_algo=metadata['Best'].value_counts().idxmax())
     
@@ -205,11 +208,10 @@ if __name__ == "__main__":
 
     parser.add_argument('metapath', type=str)
     parser.add_argument('outpath', type=str)
-    # parser.add_argument('lab', type=str)
     parser.add_argument('step', type=int)
-    parser.add_argument('cores', type=int)
     
     # optional argument scaler
+    parser.add_argument('-cores', type=int, default=1)
     parser.add_argument('-scaler', type=str, default='s')
     parser.add_argument('-feat', type=str, default='selected_features.csv')
     parser.add_argument('-params', type=str, default='pred_params')
@@ -230,8 +232,6 @@ if __name__ == "__main__":
     # ])
 
     if featS.endswith('.csv'):
-        # selFeat_DF = pd.read_csv(f'../{featS}', index_col=0)
-        # selFeats = list(selFeat_DF.loc[args.lab,'features'].split(' '))
         selFeats = list(pd.read_csv(
             outpath + 'selected_features.csv', index_col=0).iloc[0].values)
 
@@ -256,12 +256,12 @@ if __name__ == "__main__":
         else:
             pred_paramDF = pd.read_csv(outpath+param_path+'.csv', index_col=0)
 
-        pred_eval(metadata, None, 'iSpace.pkl', outpath, cores, 
+        pred_eval(metadata, 'iSpace.pkl', outpath, cores, 
                   pred_paramDF, args.tie_lab)
         
     elif args.step == 6:
         proj_to_is('iSpace.pkl', outpath, args.rproj)
-        
+
     # update if successful
     f = open(outpath + 'status.txt', 'w')
     f.write('1')

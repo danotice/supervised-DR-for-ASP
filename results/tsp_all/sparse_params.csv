@@ -1,0 +1,4 @@
+proj,subclass,nFeat,eta
+SPLS,NA,0,0.9
+SrPLS,NA,0,0.9
+SLDA,NA,6,NA

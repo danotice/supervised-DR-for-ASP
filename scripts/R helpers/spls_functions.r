@@ -1,4 +1,5 @@
 library(spls)
+library(pls)
 library(e1071)
 library(tibble)
 library(dplyr)
@@ -74,3 +75,59 @@ proj.pred.spls <- function(spls.mod, svm.mod, x, best){
   
   return(cbind(projS, Best = best, pred_svm = predS, probs))
 }
+
+
+rcv.spls.par <- function(x, y, best, K, reps, eta.int, scalers=c(FALSE,FALSE), n.cores){
+  cl = makeForkCluster(n.cores)
+  registerDoParallel(cl)
+  
+  As = c(Inf)
+  eta.list = seq(0,0.99,eta.int)
+  
+  pred.accuracySVM = tibble() 
+  
+  formulaP = as.formula("Best ~ Z1 + Z2")
+  train_control <- trainControl(
+    method = "repeatedcv", 
+    number = K, repeats = reps
+  )
+  tune_gridRad <- expand.grid(C = 10^(-3:3), sigma =10^(-3:3))
+  
+  for(i in 1:length(eta.list)){
+    
+    print(eta.list[i])
+    mod = spls(x, y, scale.x = scalers[1], scale.y = scalers[2],
+               fit = "oscorespls",
+               K=2, eta=eta.list[i])
+    
+    if(length(mod$A) != As[length(As)]){
+      projS = project.spls(mod,x)
+      projS = cbind(projS, Best= best)
+      
+      set.seed(111)
+      sel.svmR = train(
+        formulaP, data = projS,
+        method = "svmRadial",
+        trControl = train_control,
+        metric = "Accuracy",
+        tuneGrid = tune_gridRad,
+        preProcess = c("center","scale")
+      )
+      
+      pred.accuracySVM = rbind(
+        pred.accuracySVM,
+        tibble(eta = eta.list[i], feats = length(mod$A), C = sel.svmR$bestTune$C, sigma = sel.svmR$bestTune$sigma, accuracy = max(sel.svmR$results$Accuracy))
+      )
+    }
+    
+    As = c(As, length(mod$A))
+  }
+  
+  best.params = pred.accuracySVM[which.max(pred.accuracySVM$accuracy),]
+  
+  stopCluster(cl)
+  print(best.params)
+  
+  return(best.params)
+}
+

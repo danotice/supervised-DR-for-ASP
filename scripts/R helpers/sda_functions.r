@@ -1,5 +1,8 @@
 library(elasticnet)
 library(MASS)
+library(mda)
+library(sparseLDA)
+
 
 sda.run <- function(X,Y,q, tol, maxit, lambda, trace){
   #browser()
@@ -435,35 +438,328 @@ bic.smda <- function(object){
 }
 
 
-# ####### Glass data ----------
-# data("glass")
-# glass$Type = factor(glass$Type)
-# prep = preProcess(glass,c("center", "scale"))
-# data_ = predict(prep, glass)
-# 
-# table(glass$Type)
-# 
-# sda.out = fit.sda(x = data_[,1:9], y = data_$Type, dim=2, nfeat=-4, maxit=400,trace = TRUE)
-# 
-# set.seed(121)
-# smda.out = fit.smda(x = data_[,1:9], y = data_$Type, Rj=c(2,2,1,1,1,1), Q=2, nfeat=-3, maxit=400,trace = TRUE, repInit = 5)
-# 
-# 
-# ####### PD data ----------
-# # library(mlbench)
-# data("PimaIndiansDiabetes")
-# prep = preProcess(PimaIndiansDiabetes,c("center", "scale"))
-# data_ = predict(prep, PimaIndiansDiabetes)
-# 
-# table(data_$diabetes)
-# 
-# smda.out = fit.smda(x = data_[,1:8], y = data_$diabetes, Rj=2, Q=2, nfeat=-3, maxit=400,trace = TRUE, repInit = 5)
-# 
-# 
-# smda.out$dpi
-# smda.out$rss
-# View(smda.out$Z)
-# colSums(smda.out$Z)
-# 
-# # Y = model.matrix(~ metadata_train$best - 1)
-# # X = as.matrix(prep_train[feature_names])
+rcv.mda.par <- function(formula, data, K, reps, msub, d, scaler, grid.size=0, n.cores) {
+  set.seed(1111)
+  
+  ylab = all.vars(formula)[1]
+  nclass = length(levels(data[[ylab]]))
+  
+  # subclasses to tune
+  s_list <- setNames(rep(list(1:msub), nclass), paste0(1:nclass))
+  subclasses <- do.call(expand.grid, s_list)
+  subclasses <- map(pmap(subclasses, c),unname)[-1]
+  
+  if (grid.size > 0 & grid.size < length(subclasses)){
+    subclasses = unique(c(sample(subclasses, grid.size),
+                          lapply(2:msub, function(x) rep(x, nclass))))
+  }
+  
+  # Results storage
+  Accuracy = matrix(nrow=length(subclasses),ncol=K*reps)
+  
+  for (r in 1:reps) {
+    print(r)
+    
+    folds = createFolds(data[[ylab]], K)
+    
+    for (k in 1:K) {
+      # Split into training and testing
+      train_data <- data[-folds[[k]], ]
+      test_data <- data[folds[[k]], ]
+      
+      pre = preProcess(train_data, 
+                       method = case_when(scaler == "c" ~ c("center"),
+                                          scaler == "s" ~ c("center","scale"),
+                                          scaler == "p" ~ c("YeoJohnson"),
+                                          .default =  c("center","scale"))
+      )
+      
+      train_data = predict(pre, train_data)
+      test_data = predict(pre, test_data)
+      
+      # defined after data so it will work
+      run.subclass = function(s){
+        # print(s)
+        
+        # Train model
+        model <- tryCatch(
+          mda(formula, data = train_data, subclasses = s, dimension = d,iter=10, tries=10),
+          error = function(e){ 
+            warning(paste("Unable to fit model: fold",k," rep",r,
+                          " subclasses", paste(s, collapse=",")))
+            return(NULL)  # Return NULL if an error occurs
+          }
+        )
+        
+        # If model is NULL, accuracy stays NA, otherwise proceed with predictions
+        if (!is.null(model)) {
+          predictions <- predict(model, test_data, type="class")
+          # Calculate accuracy
+          acc <- confusionMatrix(predictions, data[[ylab]][folds[[k]]])$overall['Accuracy']
+        }else{
+          acc = NA_real_
+        }
+        return(unname(acc))
+      }
+      # Loop over subclass combinations -- PARALLEL
+      Accuracy[,K*(r-1)+k] = mcmapply(FUN=run.subclass, s=subclasses,mc.cores = n.cores)
+      
+    }
+    # print(results)
+  }
+  
+  AccuracyM = rowMeans(Accuracy, na.rm = TRUE)
+  Accuracy = tibble(Accuracy)
+  Accuracy$subclass = subclasses
+  
+  bestS = subclasses[[which.max(AccuracyM)]]
+  preAll = preProcess(data, 
+                      method = case_when(scaler == "c" ~ c("center"),
+                                         scaler == "s" ~ c("center","scale"),
+                                         scaler == "p" ~ c("YeoJohnson"),
+                                         .default =  c("center","scale"))
+  )
+  bestModel = mda(formula, predict(preAll,data), subclasses = bestS, dimension = d,iter=10, tries=10)
+  
+  print(bestS)
+  print(max(AccuracyM))
+  
+  
+  return(list(model=bestModel, S=bestS, accuracy=Accuracy))
+  
+}
+
+rcv.slda.par <- function(formula, data, K, reps, nvar.list, d, scaler, n.cores){
+  cl = makeForkCluster(n.cores)
+  registerDoParallel(cl)
+  
+  train_control <- trainControl(
+    method = "repeatedcv", 
+    number = K, repeats = reps
+  )
+  tune_grid <- expand.grid(NumVars = nvar.list, lambda = 1e-6) 
+  
+  sel.slda = train(
+    formula, data = data,
+    method = "sparseLDA",
+    trControl = train_control,
+    metric = "Accuracy",
+    tuneGrid = tune_grid,
+    preProcess = case_when(scaler == "c" ~ c("center"),
+                           scaler == "s" ~ c("center","scale"),
+                           scaler == "p" ~ c("YeoJohnson"),
+                           .default =  c("center","scale")),
+    Q = d, maxIte = 5000, tol = 1e-4
+  )
+  
+  stopCluster(cl)
+  print(sel.slda$results[sel.slda$results$NumVars == sel.slda$bestTune$NumVars, c("NumVars","Accuracy")])
+  
+  return(list(model=sel.slda$finalModel, params=list(NumVars=sel.slda$bestTune$NumVars), accuracy=sel.slda$results))
+}
+
+sel.smda.par <- function(formula, data, nvar.list, msub, d, grid.size=0, n.cores){
+  ## nvar.list should have negative values
+  ## takes scaled data
+  
+  set.seed(1111)
+  
+  ylab = all.vars(formula)[1]
+  features = all.vars(formula)[2:length(all.vars(formula))]
+  nclass = length(levels(data[[ylab]]))
+  
+  # subclasses to tune
+  s_list <- setNames(rep(list(1:msub), nclass), paste0(1:nclass))
+  subclasses <- do.call(expand.grid, s_list)
+  subclasses <- map(pmap(subclasses, c),unname)[-1]
+  #subclasses <- map(pmap(subclasses, c),unname)[-1]
+  
+  param.grid <- expand.grid(
+    s_idx = seq_along(subclasses),
+    nv = nvar.list,
+    KEEP.OUT.ATTRS = FALSE
+  )
+  param.grid$s <- lapply(param.grid$s_idx, function(i) subclasses[[i]])
+  
+  if (grid.size > 0 & grid.size < nrow(param.grid)){
+    param.grid$subConst <- sapply(param.grid$s, function(v) length(unique(v))==1)
+    
+    if(sum(param.grid$subConst) >= grid.size){
+      param.grid = param.grid[param.grid$subConst, ]
+    }else{
+      grid.varied <- param.grid[!param.grid$subConst, ]
+      grid.varied <- grid.varied[sample(nrow(grid.varied), grid.size-sum(param.grid$subConst)), ]
+      
+      param.grid = rbind(
+        param.grid[param.grid$subConst, ],
+        grid.varied)
+      
+    }
+    
+  }
+  print(paste0("Checking parameter grid ", nrow(param.grid)))
+  
+  run.params <- function(s, nv){
+    smda.mod = tryCatch(
+      fit.smda(x=data[features], y=data[[ylab]], Rj=s, Q=d, nfeat=nv,
+               maxit=300, itmult=5,repInit=3, tol=1e-3),
+      error = function(e){
+        warning(paste("Unable to fit model: nvar",nv,
+                      " subclasses", paste(s, collapse=",")))
+        return(NULL)  # Return NULL if an error occurs
+      }
+    )
+    
+    if(is.null(smda.mod)){
+      return(list(model=NULL, bic=Inf, conv=FALSE))
+    }else if(is.null(smda.mod$logLik)){
+      return(list(model=smda.mod, bic=NA_real_, conv=smda.mod$conv))
+    }else{
+      return(list(model=smda.mod, bic=bic.smda(smda.mod), conv=smda.mod$conv))
+    }
+  }
+  
+  
+  #models = mcmapply(run.params, s=param.grid$s, nv=param.grid$nv, mc.cores = n.cores,SIMPLIFY = FALSE)
+  models = pbmcmapply(run.params, s=param.grid$s, nv=param.grid$nv, mc.cores = n.cores,SIMPLIFY = FALSE,
+                      ignore.interactive=TRUE)
+  
+  bics <- sapply(models, function(m) if (isTRUE(m$conv)) m$bic else NA)
+  best.mod = models[[which.min(bics)]]
+  
+  param.grid = cbind(
+    param.grid[c('nv','s')],
+    bic = bics,
+    conv = sapply(models, function(m) m$conv))
+  
+  cat("subclasses ", best.mod$model$Rj, " nfeat ", best.mod$model$nfeat)
+  
+  return(list(scores = param.grid,
+              model = best.mod$model))
+  
+}
+
+rcv.smda.par <- function(formula, data, K, reps, msub, nvar.list, d, scaler, grid.size=0, n.cores, initMethod='kmeans'){
+  ## nvar.list should have negative values
+  ## takes scaled data
+  
+  set.seed(1111)
+  
+  ylab = all.vars(formula)[1]
+  features = all.vars(formula)[2:length(all.vars(formula))]
+  nclass = length(levels(data[[ylab]]))
+  #browser()
+  
+  # subclasses to tune
+  s_list <- setNames(rep(list(1:msub), nclass), paste0(1:nclass))
+  subclasses <- do.call(expand.grid, s_list)
+  subclasses <- map(pmap(subclasses, c),unname)[-1]
+  
+  param.grid <- expand.grid(
+    s_idx = seq_along(subclasses),
+    nv = nvar.list,
+    KEEP.OUT.ATTRS = FALSE
+  )
+  param.grid$s <- lapply(param.grid$s_idx, function(i) subclasses[[i]])
+  
+  if (grid.size > 0 & grid.size < nrow(param.grid)){
+    param.grid$subConst <- sapply(param.grid$s, function(v) length(unique(v))==1)
+    
+    if(sum(param.grid$subConst) >= grid.size){
+      param.grid = param.grid[param.grid$subConst, ]
+    }else{
+      grid.varied <- param.grid[!param.grid$subConst, ]
+      grid.varied <- grid.varied[sample(nrow(grid.varied), grid.size-sum(param.grid$subConst)), ]
+      
+      param.grid = rbind(
+        param.grid[param.grid$subConst, ],
+        grid.varied)
+      
+    }
+    
+  }
+  print(paste0("Checking parameter grid ", nrow(param.grid)))
+  
+  # Results storage
+  Accuracy = matrix(nrow=nrow(param.grid),ncol=K*reps)
+  
+  #folds = create_folds(data[[ylab]], K, m_rep = reps, use_names = FALSE, invert = TRUE)
+  
+  for (r in 1:reps) {
+    print(r)
+    
+    folds = createFolds(data[[ylab]], K) 
+    
+    for (k in 1:K) {
+      
+      #f = (r-1)*K + k 
+      # Split into training and testing
+      train_data <- data[-folds[[k]], ]
+      test_data <- data[folds[[k]], ]
+      
+      pre = preProcess(train_data, 
+                       method = case_when(scaler == "c" ~ c("center"),
+                                          scaler == "s" ~ c("center","scale"),
+                                          scaler == "p" ~ c("YeoJohnson"),
+                                          .default =  c("center","scale"))
+      )
+      
+      train_data = predict(pre, train_data)
+      test_data = predict(pre, test_data)
+      
+      run.params <- function(s, nv){
+        smda.mod = tryCatch(
+          fit.smda(x=train_data[features], y=train_data[[ylab]], Rj=s, Q=d, nfeat=nv,
+                   maxit=300, itmult=5,repInit=5, tol=1e-3, initMethod = initMethod),
+          error = function(e){
+            warning(paste("Unable to fit model: nvar",nv,
+                          " subclasses", paste(s, collapse=",")))
+            return(NULL)  # Return NULL if an error occurs
+          }
+        )
+        
+        # If model is NULL, accuracy stays NA, otherwise proceed with predictions
+        if (!is.null(smda.mod)) {
+          #if (smda.mod$conv){
+          predictions <- predict.smda(smda.mod, test_data[features])$class
+          # Calculate accuracy
+          acc <- confusionMatrix(predictions, test_data[[ylab]])$overall['Accuracy']
+          # }else{
+          #   acc = NA_real_
+          # }
+        }else{
+          acc = NA_real_
+        }
+        return(unname(acc))
+      }
+      
+      # Loop over subclass combinations -- PARALLEL
+      out = mcmapply(run.params, s=param.grid$s, nv=param.grid$nv, mc.cores = n.cores)
+      #browser()
+      Accuracy[,(r-1)*K + k] = out
+      
+    }
+  }
+  
+  AccuracyM = rowSums(Accuracy, na.rm = TRUE)/ncol(Accuracy)
+  Accuracy = as_tibble(Accuracy)
+  Accuracy$subclass = param.grid$s
+  Accuracy$nfeat = param.grid$nv
+  
+  bestS = list(subclass=param.grid$s[[which.max(AccuracyM)]],
+               nfeat=param.grid$nv[[which.max(AccuracyM)]])
+  preAll = preProcess(data, 
+                      method = case_when(scaler == "c" ~ c("center"),
+                                         scaler == "s" ~ c("center","scale"),
+                                         scaler == "p" ~ c("YeoJohnson"),
+                                         .default =  c("center","scale"))
+  )
+  #browser()
+  bestModel = fit.smda(x=predict(preAll,data)[features], y=data[[ylab]], Rj=bestS$subclass, Q=d, nfeat=bestS$nfeat,
+                       maxit=300, itmult=5,repInit=5, tol=1e-3)
+  
+  print(bestS)
+  print(max(AccuracyM))
+  
+  return(list(model=bestModel, S=bestS, accuracy=Accuracy))
+}

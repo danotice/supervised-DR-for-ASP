@@ -1,50 +1,58 @@
 #!/bin/bash
 
 ##source ~/start-pyenv
-##cd ~/PhD-ASP-Methods/
-source ./env/bin/activate
-cd ./scripts/
-chmod +x da_proj.r
+# source ./env/bin/activate
+# cd ./scripts/
+chmod +x *.r
 
 # params
 
 metapath=../metadata/tsp.csv
-outpath=../Results/tsp_all/
-lab=tsp
+outpath=../results/tsp_all/
 
 # Preprocess
-python proj_set.py $metapath $outpath $lab 1 -feat all
+python proj_set.py $metapath $outpath 1 -feat all
 
 # Run DA
 if test -f "${outpath}status.txt"; then
     rm -r "${outpath}status.txt"
-    ./da_par.r $outpath 1
+    ./da_par.r $outpath 1 #cv
 else
-    echo "previous step failed"
+    echo "failed to preprocess"
 fi
 
 # make projections
 if test -f "${outpath}status.txt"; then
     rm -r "${outpath}status.txt"
-    python proj_set.py $metapath $outpath $lab 2 
+    python proj_set.py $metapath $outpath 2 
 else
-    echo "previous step failed"
+    echo "previous step - DA"
 fi
 
-# make sparse projections
+## make sparse projections
 if test -f "${outpath}status.txt"; then
     rm -r "${outpath}status.txt"
-    ./sparse_par.r $outpath
+    ./sparse_par.r $outpath 1 #cv
 else
-    echo "previous step failed"
+    echo "previous step failed - projections"
 fi
-# make and eval predictions
+
+# add sparse projections
 if test -f "${outpath}status.txt"; then
     rm -r "${outpath}status.txt"
-    # python proj_set.py $metapath $outpath $lab 3 
-    python proj_set.py $metapath $outpath $lab 5 
+    python proj_set.py $metapath $outpath 6 -rproj sda_proj.csv 
+    python proj_set.py $metapath $outpath 6 -rproj spls_proj.csv
 else
-    echo "previous step failed"
+    echo "previous step failed - sparse proj"
+fi
+
+## make and eval predictions
+if test -f "${outpath}status.txt"; then
+    rm -r "${outpath}status.txt"
+    # python proj_set.py $metapath $outpath 3 
+    python proj_set.py $metapath $outpath 5 -params default
+else
+    echo "previous step failed - add sparse proj"
 fi
 
 

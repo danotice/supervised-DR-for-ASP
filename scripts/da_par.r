@@ -14,105 +14,28 @@ library(caret)
 #library(splitTools)
 library(Matrix)
 
+source("./R helpers/sda_functions.r")
+
 # Parse command-line arguments
 args <- commandArgs(trailingOnly = TRUE)
 
-outfol <- args[1]
-ncores <- as.integer(args[2])
-#subFt <- logical(args[4])
+## defaults 
+cv = FALSE
+cv.grid = 30
 
-######## functions ###############
-rcv.mda.par <- function(formula, data, K, reps, msub, d, scaler, grid.size=0, n.cores) {
-  set.seed(1111)
-  
-  ylab = all.vars(formula)[1]
-  nclass = length(levels(data[[ylab]]))
-  
-  # subclasses to tune
-  s_list <- setNames(rep(list(1:msub), nclass), paste0(1:nclass))
-  subclasses <- do.call(expand.grid, s_list)
-  subclasses <- map(pmap(subclasses, c),unname)[-1]
-  
-  if (grid.size > 0 & grid.size < length(subclasses)){
-    subclasses = unique(c(sample(subclasses, grid.size),
-                          lapply(2:msub, function(x) rep(x, nclass))))
+if (length(args)>=2){
+  outfol <- args[1]
+  ncores <- as.integer(args[2])
+}else if (length(args)==3){
+  cv = TRUE
+  if (!is.na(as.integer(args[3]))){
+    cv.grid = as.integer(args[3])
   }
-  
-  # Results storage
-  Accuracy = matrix(nrow=length(subclasses),ncol=K*reps)
-  
-  for (r in 1:reps) {
-    print(r)
-    
-    folds = createFolds(data[[ylab]], K)
-    
-    for (k in 1:K) {
-      # Split into training and testing
-      train_data <- data[-folds[[k]], ]
-      test_data <- data[folds[[k]], ]
-      
-      pre = preProcess(train_data, 
-                       method = case_when(scaler == "c" ~ c("center"),
-                                          scaler == "s" ~ c("center","scale"),
-                                          scaler == "p" ~ c("YeoJohnson"),
-                                          .default =  c("center","scale"))
-      )
-      
-      train_data = predict(pre, train_data)
-      test_data = predict(pre, test_data)
-      
-      # defined after data so it will work
-      run.subclass = function(s){
-        # print(s)
-        
-        # Train model
-        model <- tryCatch(
-          mda(formula, data = train_data, subclasses = s, dimension = d,iter=10, tries=10),
-          error = function(e){ 
-            warning(paste("Unable to fit model: fold",k," rep",r,
-                          " subclasses", paste(s, collapse=",")))
-            return(NULL)  # Return NULL if an error occurs
-          }
-        )
-        
-        # If model is NULL, accuracy stays NA, otherwise proceed with predictions
-        if (!is.null(model)) {
-          predictions <- predict(model, test_data, type="class")
-          # Calculate accuracy
-          acc <- confusionMatrix(predictions, data[[ylab]][folds[[k]]])$overall['Accuracy']
-        }else{
-          acc = NA_real_
-        }
-        return(unname(acc))
-      }
-      # Loop over subclass combinations -- PARALLEL
-      Accuracy[,K*(r-1)+k] = mcmapply(FUN=run.subclass, s=subclasses,mc.cores = n.cores)
-      
-    }
-    # print(results)
-  }
-  
-  AccuracyM = rowMeans(Accuracy, na.rm = TRUE)
-  Accuracy = tibble(Accuracy)
-  Accuracy$subclass = subclasses
-  
-  bestS = subclasses[[which.max(AccuracyM)]]
-  preAll = preProcess(data, 
-                      method = case_when(scaler == "c" ~ c("center"),
-                                         scaler == "s" ~ c("center","scale"),
-                                         scaler == "p" ~ c("YeoJohnson"),
-                                         .default =  c("center","scale"))
-  )
-  bestModel = mda(formula, predict(preAll,data), subclasses = bestS, dimension = d,iter=10, tries=10)
-  
-  print(bestS)
-  print(max(AccuracyM))
-  
-  
-  return(list(model=bestModel, S=bestS, accuracy=Accuracy))
-  
+}else{
+  stop('invalid number of arguments. must be 2 or 3 (if doing cv).', call. = FALSE)
 }
 
+#subFt <- logical(args[4])
 
 ###### DATA ###############
 
@@ -152,9 +75,16 @@ processed_test = predict(preAll, metadata_test)
 ####### MDA proj ------
 if(feat.rank >= length(selected_features)){
   
-  mod.mda = rcv.mda.par(formula_, data = metadata_train, K=5, reps = 1,msub=10,d=2, 
-                        scaler=scaler,grid.size=30, n.cores=ncores)
-  best.mda = mod.mda$model
+  if (cv){
+    mod.mda = rcv.mda.par(formula_, data = metadata_train, K=5, reps = 1,msub=10,d=2, 
+                          scaler=scaler,grid.size=30, n.cores=ncores)
+    best.mda = mod.mda$model
+  } else {
+    mod.mda = NULL
+    best.mda = mda(formula_, processed_train, subclasses = 3, dimension = 2,iter=10, tries=10)
+  }
+  
+  
   
   name.mod = paste("MDA",scaler,sep="_")
   # if(sum(mod.mda$S)>A){ # add only if LDA not best -- not doing because I need to know if fitted
@@ -176,7 +106,8 @@ if(feat.rank >= length(selected_features)){
                   ~ paste0("prob_da_", .)))
   
   Z = rbind(Z, Z.mda)
-  param.df = rbind(param.df, tibble(proj=name.mod,subclass=list(mod.mda$S),nFeat=NA))
+  param.df = rbind(param.df, tibble(proj=name.mod,subclass=
+                                      ifelse(cv,list(mod.mda$S),3),nFeat=NA))
   
   if(scaler=="s"){
     mod.mda.s = mod.mda
@@ -218,39 +149,39 @@ if(scaler=="s"){
 rm(best.lda)
 
 
-#### fit PLSDA ####
-
-best.plsda = plsda(x = rbind(metadata_train[selected_features],metadata_test[selected_features]), 
-                   y = c(metadata_train$Best,metadata_test$Best), 
-                   subset=1:length(metadata_train),
-                   method="oscorespls",
-                   ncomp = 2,validation="none",
-                   scale = TRUE, center = TRUE)
-
-## may or may not be broken!
-attr(best.plsda,"class") = c("mvr", "plsda")
-plsda.x = predict(best.plsda,rbind(metadata_train[selected_features],metadata_test[selected_features]),type = "scores")
-
-Z.plsda = tibble(
-  proj = rep("PLSDA",N),
-  instances = c(metadata_train$instances,metadata_test$instances),
-  group = c(rep("train",nrow(metadata_train)), rep("test",nrow(metadata_test))),
-  Z1 = plsda.x[,1],
-  Z2 = plsda.x[,2],
-  Best = c(metadata_train[["Best"]],metadata_test[["Best"]])
-)
-
-attr(best.plsda,"class") = c("plsda","mvr")
-Z.plsda = mutate(Z.plsda,
-                 pred_da = predict(best.plsda, rbind(metadata_train[selected_features],metadata_test[selected_features]), type = 'class')
-)
-Z.plsda = cbind(Z.plsda,
-                rename_with(data.frame(
-                  predict(best.plsda,rbind(metadata_train[selected_features],metadata_test[selected_features]), 
-                          type="prob", probMethod = "Bayes")[,,1]), ~ paste0("prob_da_", .)))
-
-
-Z = rbind(Z, Z.plsda)
+# #### fit PLSDA ####
+# 
+# best.plsda = plsda(x = rbind(metadata_train[selected_features],metadata_test[selected_features]), 
+#                    y = c(metadata_train$Best,metadata_test$Best), 
+#                    subset=1:length(metadata_train),
+#                    method="oscorespls",
+#                    ncomp = 2,validation="none",
+#                    scale = TRUE, center = TRUE)
+# 
+# ## may or may not be broken!
+# attr(best.plsda,"class") = c("mvr", "plsda")
+# plsda.x = predict(best.plsda,rbind(metadata_train[selected_features],metadata_test[selected_features]),type = "scores")
+# 
+# Z.plsda = tibble(
+#   proj = rep("PLSDA",N),
+#   instances = c(metadata_train$instances,metadata_test$instances),
+#   group = c(rep("train",nrow(metadata_train)), rep("test",nrow(metadata_test))),
+#   Z1 = plsda.x[,1],
+#   Z2 = plsda.x[,2],
+#   Best = c(metadata_train[["Best"]],metadata_test[["Best"]])
+# )
+# 
+# attr(best.plsda,"class") = c("plsda","mvr")
+# Z.plsda = mutate(Z.plsda,
+#                  pred_da = predict(best.plsda, rbind(metadata_train[selected_features],metadata_test[selected_features]), type = 'class')
+# )
+# Z.plsda = cbind(Z.plsda,
+#                 rename_with(data.frame(
+#                   predict(best.plsda,rbind(metadata_train[selected_features],metadata_test[selected_features]), 
+#                           type="prob", probMethod = "Bayes")[,,1]), ~ paste0("prob_da_", .)))
+# 
+# 
+# Z = rbind(Z, Z.plsda)
 
 
 ############ OUTPUT ###########
@@ -269,3 +200,8 @@ if(nrow(param.df) > 0){
 ### save objects
 save(list = ls(pattern = "^(best\\.|mod\\.)"), file = paste0(outfol,"da_proj.Rdata"))
 
+## update status if successful
+file.create(paste0(outfol,"status.txt"))
+fileConn<-file(paste0(outfol,"status.txt"))
+writeLines("1", fileConn)
+close(fileConn)
