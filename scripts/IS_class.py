@@ -337,6 +337,30 @@ class InstanceSpace():
 
         print(f'Features dropped. Remaining features: {self.m}')        
 
+    def initPlotData(self, type='perf',feats=[]):
+        """Puts all the data needed for plots in Proj dataframe.
+
+        Args:
+            type (str, optional): which data matrix to add (best, perf, feat). Defaults to 'best'.
+        """
+
+        if type=="perf":
+            self.PlotProj[self.algorithms] = self.performance[self.algorithms]
+            print('performance data available for visualisation')
+        
+        elif type=="feat":
+            skipped = []
+            for f in feats:
+                if f in self.featureNames:
+                    self.PlotProj[f] = self.features[f]
+                else:
+                    skipped.append(f)
+            if len(skipped) > 0:
+                print(f"Features {skipped} not found in metadata")
+            print('feature data available for visualisation')
+        
+        else:
+            print('No data added to PlotProj')
 
     def plot(self, proj, hue=None, legend=True):
 
